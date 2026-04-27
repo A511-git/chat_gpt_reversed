@@ -8,8 +8,8 @@
  */
 
 import { v4 as uuidv4 } from "uuid";
-import { parseSRT } from "../../src/lib/srtParser.js";
-import { chunkBlocks } from "../../src/lib/chunker.js";
+import { parseSRT } from "../../lib/srtParser.js";
+import { chunkBlocks } from "../../lib/chunker.js";
 import {
     createJob,
     readMeta,
@@ -17,7 +17,7 @@ import {
     readChunk,
     readFinalSRT,
     finalPath,
-} from "../../src/lib/jobManager.js";
+} from "../../lib/jobManager.js";
 import fs from "fs/promises";
 
 export default async function srtRoutes(fastify) {
@@ -56,7 +56,7 @@ export default async function srtRoutes(fastify) {
 
         // 4. Persist instruction in meta so the worker can read it
         // (createJob sets status: "pending" – worker picks it up automatically)
-        const metaPath = (await import("../../src/lib/jobManager.js")).metaPath(jobId);
+        const metaPath = (await import("../../lib/jobManager.js")).metaPath(jobId);
         const meta = JSON.parse(await fs.readFile(metaPath, "utf8"));
         meta.instruction = instruction;
         await fs.writeFile(metaPath, JSON.stringify(meta, null, 2));
