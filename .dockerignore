@@ -1,0 +1,38 @@
+# ─── Node ────────────────────────────────────────────────
+node_modules
+npm-debug.log
+yarn-error.log
+pnpm-debug.log
+
+# ─── Git ─────────────────────────────────────────────────
+.git
+.gitignore
+
+# ─── CI/CD ───────────────────────────────────────────────
+.github
+
+# ─── Local env ───────────────────────────────────────────
+.env
+.env.*
+
+# ─── OS / Editor ─────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode
+.idea
+
+# ─── Logs ────────────────────────────────────────────────
+logs
+*.log
+
+# ─── Build / Cache ───────────────────────────────────────
+dist
+build
+.cache
+
+# ─── Docker files not needed inside image ────────────────
+docker-compose.yml
+docker-compose.override.yml
+
+# ─── Runtime data (VERY IMPORTANT for your app) ───────────
+data
