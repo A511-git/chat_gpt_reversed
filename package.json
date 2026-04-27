@@ -10,9 +10,9 @@
     "dev:worker": "node --watch src/worker/worker.js"
   },
   "dependencies": {
-    "fastify": "^4.27.0",
     "@fastify/cors": "^9.0.1",
-    "chatgptreversed": "^1.0.0",
+    "chatgptreversed": "^0.2.5",
+    "fastify": "^4.27.0",
     "uuid": "^9.0.0"
   }
 }
