@@ -1,177 +1,116 @@
 /**
  * aiProcessor.js
  *
- * Two-phase AI processing strategy:
- *
- * Phase 1 – Context Pass (once per job)
- *   Send the FULL raw SRT to the model so it understands the overall
- *   content, speakers, domain vocabulary, and tone.
- *   Store the returned context summary in meta.json.
- *
- * Phase 2 – Chunk Processing (once per chunk)
- *   Send each chunk as structured JSON together with the stored context.
- *   The model must return the SAME JSON structure, modifying ONLY `text`.
+ * - Phase 1: generate context summary from full SRT (stateless, plain text)
+ * - Phase 2: process chunks using raw SRT format (preserves indexes & timestamps)
+ * - Uses persistent conversation per job (completeInConversation)
  */
 
-import { ChatGPTReversed } from "chatgptreversed";
+import { ChatGPTReversed } from "../chatgptreversed/index.js";
+import { parseSRT, blocksToSRT } from "./srtParser.js";
+import fs from "fs/promises";
 
-const chatgpt = new ChatGPTReversed();
+const chatgpt = new ChatGPTReversed({ maintainSession: true });
 
-const MAX_RETRIES = 3;
+const MAX_SRT_RETRIES = 3;
 
-// ─── Phase 1: Context Pass ───────────────────────────────────────────────────
+// ─── Logger ───────────────────────────────────────────────────────────────────
+async function logToFile(data) {
+    const time = new Date().toISOString();
+    await fs.appendFile("log.txt", `\n\n[${time}]\n${data}\n`).catch(() => { });
+}
 
-/**
- * Send the full SRT to the model and receive a context summary.
- * This is called once when a job is first created, before any chunks
- * are processed.
- *
- * @param {string} fullSrtText - Complete raw SRT content
- * @returns {Promise<string>} - A concise context summary from the model
- */
+// ─── AI call with exponential backoff for rate limits (stateless) ────────────
+async function callAI(prompt) {
+    const MAX_BACKOFF_ATTEMPTS = 4;
+    let delay = 5000;
+
+    for (let attempt = 1; attempt <= MAX_BACKOFF_ATTEMPTS; attempt++) {
+        try {
+            return await chatgpt.complete(prompt);
+        } catch (err) {
+            const is429 = err?.message?.includes("429");
+            if (is429 && attempt < MAX_BACKOFF_ATTEMPTS) {
+                await logToFile(`=== 429 — waiting ${delay}ms ===`);
+                console.warn(`[ai] 429 — waiting ${delay}ms (attempt ${attempt})`);
+                await sleep(delay);
+                delay *= 2;
+            } else {
+                throw err;
+            }
+        }
+    }
+}
+
+// ─── Phase 1: Context Pass (stateless) ───────────────────────────────────────
 export async function generateContextSummary(fullSrtText) {
-    const prompt = `You are an expert subtitle translator and editor.
-
-Below is the COMPLETE subtitle file you will be working on.
-Read it carefully and produce a CONCISE CONTEXT SUMMARY (max 200 words) covering:
-- Topic / subject matter
-- Key speakers or characters (if identifiable)
-- Domain vocabulary or jargon to watch for
-- Overall tone (formal, casual, technical, etc.)
-
-This summary will be injected into every subsequent subtitle-editing request
-so you can maintain perfect consistency throughout.
-
-Do NOT edit anything yet. Only return the summary.
-
---- FULL SRT FILE START ---
-${fullSrtText}
---- FULL SRT FILE END ---`;
-
-    const response = await chatgpt.complete(prompt);
+    const prompt = `Summarize in 50 words: language used, vocabulary level, speaking style.\n\n${fullSrtText.slice(0, 2000)}`;
+    const response = await callAI(prompt);
+    await logToFile(`=== CONTEXT SUMMARY ===\n${response}`);
     return response.trim();
 }
 
-// ─── Phase 2: Chunk Processing ───────────────────────────────────────────────
+// ─── Phase 2: Chunk processing using raw SRT format ──────────────────────────
+export async function processChunkWithConversation(blocks, conversationId, parentMessageId, instruction) {
+    // Convert blocks to raw SRT text
+    const inputSrt = blocksToSRT(blocks);
+    await logToFile(`=== CHUNK conversation ${conversationId} (${blocks.length} blocks) ===\n${inputSrt}`);
 
-/**
- * Process a single chunk of subtitle blocks using the model.
- *
- * Rules enforced via prompt:
- *   - Modify ONLY the `text` field of each block
- *   - NEVER change `index` or `timestamp`
- *   - Return valid JSON array – no markdown fences, no extra keys
- *
- * @param {{ index: number, timestamp: string, text: string }[]} blocks
- * @param {string} contextSummary - Summary from Phase 1
- * @param {string} userInstruction - What the user wants done (e.g. "translate to Spanish")
- * @returns {Promise<{ index: number, timestamp: string, text: string }[]>}
- */
-export async function processChunk(blocks, contextSummary, userInstruction) {
-    const inputJson = JSON.stringify(blocks, null, 2);
+    // First message of the conversation includes the instruction
+    let message = inputSrt;
+    if (parentMessageId === "client-created-root") {
+        message = `${instruction}\n\nReturn the EXACT same SRT structure (index numbers, timestamps, block order) but with the subtitle text edited according to the instruction. Preserve all timestamps and index numbers. Output ONLY valid SRT text, no extra commentary or markdown.\n\n${inputSrt}`;
+    }
 
-    const prompt = `You are an expert subtitle translator and editor working on a larger subtitle file.
-
-## CONTEXT SUMMARY
-${contextSummary}
-
-## YOUR TASK
-${userInstruction}
-
-## SUBTITLE OPTIMIZATION RULES (VERY IMPORTANT)
-
-You are NOT writing paragraphs. You are editing subtitles for screen readability.
-
-Follow these strictly:
-
-1. Fix grammar, spelling, and incorrect words.
-2. If a word is clearly wrong or misheard, replace it with the most likely correct word.
-3. Remove filler / noise words:
-   - uh, um, you know, like, actually, basically, etc.
-4. Remove repetition:
-   - "I I think" → "I think"
-   - "very very good" → "very good"
-5. Keep subtitles SHORT and READABLE:
-   - Do NOT expand into long sentences
-   - Avoid adding extra explanation
-6. Maintain approximately the SAME LENGTH:
-   - Do NOT significantly increase word count
-   - Slight shortening is preferred over expansion
-7. Preserve meaning EXACTLY:
-   - Do NOT change intent or tone
-8. Keep natural spoken style:
-   - Not too formal unless context demands it
-9. If text is already good → keep it unchanged
-
-## STRICT STRUCTURE RULES
-0. Translate in ENGLISH ONLY
-1. Return ONLY a valid JSON array
-2. Modify ONLY the "text" field
-3. NEVER change "index" or "timestamp"
-4. Keep SAME number of items
-5. No markdown, no backticks, no explanations
-
-## INPUT
-${inputJson}
-
-## OUTPUT (JSON only)`;
-
+    let response;
     let lastError;
-    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    for (let attempt = 1; attempt <= MAX_SRT_RETRIES; attempt++) {
         try {
-            const raw = await chatgpt.complete(prompt);
-            const parsed = safeParseJSON(raw);
-            validateChunkOutput(blocks, parsed);
-            return parsed;
+            response = await chatgpt.completeInConversation(message, {
+                conversationId,
+                parentMessageId,
+            });
+            break;
         } catch (err) {
             lastError = err;
-            console.warn(`[aiProcessor] Attempt ${attempt + 1} failed: ${err.message}`);
+            if (err.message.includes("429")) {
+                await new Promise(r => setTimeout(r, 5000 * attempt));
+            } else {
+                break;
+            }
         }
     }
+    if (!response) throw lastError;
 
-    throw new Error(`AI processing failed after ${MAX_RETRIES} attempts: ${lastError.message}`);
+    const { text: rawSrt, messageId: newParentId } = response;
+    await logToFile(`=== RAW SRT RESPONSE ===\n${rawSrt}`);
+
+    // Parse the returned SRT text into blocks
+    let processedBlocks;
+    try {
+        processedBlocks = parseSRT(rawSrt);
+    } catch (e) {
+        throw new Error(`Failed to parse returned SRT: ${e.message}`);
+    }
+
+    // Validate number of blocks
+    if (processedBlocks.length !== blocks.length) {
+        throw new Error(`Block count mismatch: expected ${blocks.length}, got ${processedBlocks.length}`);
+    }
+
+    // Ensure index numbers match the original (model may renumber from 1, we re-map)
+    // We'll map based on order: assume the model returned blocks in the same sequence.
+    // Restore original indexes and timestamps to be absolutely safe.
+    const finalBlocks = processedBlocks.map((block, idx) => ({
+        index: blocks[idx].index,
+        timestamp: blocks[idx].timestamp,   // keep original timestamps (model sometimes changes comma to period)
+        text: block.text,
+    }));
+
+    return { processedBlocks: finalBlocks, newParentMessageId: newParentId };
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-/**
- * Strip markdown code fences (```json ... ```) and parse JSON.
- */
-function safeParseJSON(raw) {
-    // Remove ```json ... ``` or ``` ... ``` wrappers the model sometimes adds
-    const cleaned = raw
-        .trim()
-        .replace(/^```(?:json)?\s*/i, "")
-        .replace(/\s*```$/, "")
-        .trim();
-
-    return JSON.parse(cleaned);
-}
-
-/**
- * Validate that the AI output respects the structural contract:
- * - Must be an array
- * - Same length as input
- * - Each item preserves original index and timestamp
- */
-function validateChunkOutput(original, output) {
-    if (!Array.isArray(output)) {
-        throw new Error("Output is not a JSON array");
-    }
-    if (output.length !== original.length) {
-        throw new Error(
-            `Output length mismatch: expected ${original.length}, got ${output.length}`,
-        );
-    }
-    for (let i = 0; i < original.length; i++) {
-        if (output[i].index !== original[i].index) {
-            throw new Error(`index mismatch at position ${i}`);
-        }
-        if (output[i].timestamp !== original[i].timestamp) {
-            throw new Error(`timestamp mismatch at position ${i} (index ${original[i].index})`);
-        }
-        if (typeof output[i].text !== "string") {
-            throw new Error(`text field missing/invalid at position ${i}`);
-        }
-    }
+// ─── Util ─────────────────────────────────────────────────────────────────────
+function sleep(ms) {
+    return new Promise(r => setTimeout(r, ms));
 }

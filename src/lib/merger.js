@@ -12,7 +12,7 @@ import {
     updateMeta,
     resultsDir,
 } from "./jobManager.js";
-import { blocksToSRT } from "../srtParser.js";
+import { blocksToSRT } from "./srtParser.js";
 import fs from "fs/promises";
 
 /**

@@ -1,30 +1,51 @@
 /**
  * chunker.js
- * Splits a flat array of subtitle blocks into ordered chunks.
- * Each chunk is sized between MIN_CHUNK_SIZE and MAX_CHUNK_SIZE blocks.
+ *
+ * MAX_LINES_PER_CHUNK reduced from 25 → 10.
+ *
+ * At 25 lines the model was consistently skipping ~half the lines even
+ * with numbered format. At 10 lines the full output fits easily within
+ * the model's comfortable range and refusal/compression drops sharply.
+ * The retry mechanism in aiProcessor handles any remaining gaps.
  */
 
-const MIN_CHUNK_SIZE = 20;
-const MAX_CHUNK_SIZE = 30;
+const MAX_LINES_PER_CHUNK = 10;
 
-/**
- * Split blocks into chunks.
- * @param {{ index: number, timestamp: string, text: string }[]} blocks
- * @param {number} [size=25] - Target chunk size (clamped to MIN/MAX)
- * @returns {{ index: number, status: string, retry: number, content: object[] }[]}
- */
-export function chunkBlocks(blocks, size = 25) {
-    const chunkSize = Math.min(MAX_CHUNK_SIZE, Math.max(MIN_CHUNK_SIZE, size));
-    const chunks = [];
+function estimateTokens(text) {
+    return Math.ceil(text.length / 4);
+}
 
-    for (let i = 0; i < blocks.length; i += chunkSize) {
-        const content = blocks.slice(i, i + chunkSize);
-        chunks.push({
-            index: chunks.length,   // 0-based chunk position
-            status: "pending",
-            retry: 0,
-            content,
-        });
+export function dynamicChunkBlocks(blocks, contextSummary) {
+    const MAX_CONTEXT_TOKENS = 12000;
+    const RESERVED_OUTPUT    = 2000;
+    const RESERVED_PROMPT    = 1500;
+
+    const contextTokens   = estimateTokens(contextSummary);
+    const availableTokens =
+        MAX_CONTEXT_TOKENS - RESERVED_OUTPUT - RESERVED_PROMPT - contextTokens;
+
+    const chunks      = [];
+    let currentChunk  = [];
+    let currentTokens = 0;
+
+    for (const block of blocks) {
+        const tokens = estimateTokens(block.text);
+
+        const tokensFull = currentTokens + tokens > availableTokens;
+        const linesFull  = currentChunk.length >= MAX_LINES_PER_CHUNK;
+
+        if ((tokensFull || linesFull) && currentChunk.length > 0) {
+            chunks.push(currentChunk);
+            currentChunk  = [];
+            currentTokens = 0;
+        }
+
+        currentChunk.push(block);
+        currentTokens += tokens;
+    }
+
+    if (currentChunk.length > 0) {
+        chunks.push(currentChunk);
     }
 
     return chunks;

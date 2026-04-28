@@ -1,76 +1,80 @@
-/**
- * routes/srt.js
- * All SRT-related API routes:
- *
- *   POST /api/srt/process           - upload SRT, create job
- *   GET  /api/srt/:jobId            - poll job status
- *   GET  /api/srt/:jobId/download   - download final.srt
- */
-
 import { v4 as uuidv4 } from "uuid";
 import { parseSRT } from "../../lib/srtParser.js";
-import { chunkBlocks } from "../../lib/chunker.js";
 import {
     createJob,
     readMeta,
     listChunkIndices,
     readChunk,
     readFinalSRT,
-    finalPath,
 } from "../../lib/jobManager.js";
 import fs from "fs/promises";
 
 export default async function srtRoutes(fastify) {
-    // ── POST /api/srt/process ──────────────────────────────────────────────────
-    fastify.post("/process", {
-        schema: {
-            body: {
-                type: "object",
-                required: ["srtText"],
-                properties: {
-                    srtText: { type: "string", minLength: 1 },
-                    instruction: { type: "string" },    // optional custom AI instruction
-                    chunkSize: { type: "integer", minimum: 20, maximum: 30 },
-                },
-            },
-        },
-    }, async (request, reply) => {
-        const {
-            srtText,
-            instruction = "Fix grammar, punctuation and naturalness of the subtitles. Keep the meaning intact.",
-            chunkSize = 25,
-        } = request.body;
 
-        // 1. Parse SRT → blocks
-        const blocks = parseSRT(srtText);
-        if (blocks.length === 0) {
-            return reply.code(400).send({ error: "No valid subtitle blocks found in srtText" });
+    // ── POST /api/srt/process ─────────────────────────────
+    fastify.post("/process", async (request, reply) => {
+
+        let srtText;
+        let instruction = "Fix grammar, punctuation and naturalness of the subtitles. Keep the meaning intact.";
+
+        // ── Parse input ───────────────────────────────────
+        if (request.isMultipart()) {
+            const parts = request.parts();
+
+            for await (const part of parts) {
+                if (part.type === "file") {
+                    const buffer = await part.toBuffer();
+                    srtText = buffer.toString();
+                } else {
+                    if (part.fieldname === "srtText") srtText = part.value;
+                    if (part.fieldname === "instruction") instruction = part.value || instruction;
+                }
+            }
+        } else {
+            ({
+                srtText,
+                instruction = instruction,
+            } = request.body);
         }
 
-        // 2. Chunk blocks
-        const chunks = chunkBlocks(blocks, chunkSize);
+        if (!srtText || typeof srtText !== "string") {
+            return reply.code(400).send({ error: "srtText is required" });
+        }
 
-        // 3. Create job on disk
+        // ── Parse SRT → blocks ────────────────────────────
+        const blocks = parseSRT(srtText);
+
+        if (blocks.length === 0) {
+            return reply.code(400).send({ error: "No valid subtitle blocks found" });
+        }
+
+        // ── Create job WITHOUT chunks ─────────────────────
         const jobId = `job-${uuidv4()}`;
-        await createJob(jobId, chunks, srtText);
+        await createJob(jobId, [], srtText); // no chunking here
 
-        // 4. Persist instruction in meta so the worker can read it
-        // (createJob sets status: "pending" – worker picks it up automatically)
-        const metaPath = (await import("../../lib/jobManager.js")).metaPath(jobId);
-        const meta = JSON.parse(await fs.readFile(metaPath, "utf8"));
+        // ── Save metadata ─────────────────────────────────
+        const { metaPath } = await import("../../lib/jobManager.js");
+        const metaFile = metaPath(jobId);
+
+        const meta = JSON.parse(await fs.readFile(metaFile, "utf8"));
+
         meta.instruction = instruction;
-        await fs.writeFile(metaPath, JSON.stringify(meta, null, 2));
+        meta.originalBlocks = blocks; // 🔥 IMPORTANT (worker uses this)
+        meta.totalChunks = 0;
+        meta.completedChunks = 0;
 
-        fastify.log.info(`[api] Created job ${jobId} with ${chunks.length} chunks`);
+        await fs.writeFile(metaFile, JSON.stringify(meta, null, 2));
+
+        fastify.log.info(`[api] Created job ${jobId} with ${blocks.length} blocks`);
 
         return reply.code(201).send({
             jobId,
-            totalChunks: chunks.length,
             totalBlocks: blocks.length,
+            message: "Job created. Chunking will be done by worker dynamically.",
         });
     });
 
-    // ── GET /api/srt/:jobId ────────────────────────────────────────────────────
+    // ── GET /api/srt/:jobId ─────────────────────────────
     fastify.get("/:jobId", async (request, reply) => {
         const { jobId } = request.params;
 
@@ -79,12 +83,17 @@ export default async function srtRoutes(fastify) {
             return reply.code(404).send({ error: "Job not found" });
         }
 
-        // Build a chunk-level breakdown for visibility
         const chunkIndices = await listChunkIndices(jobId).catch(() => []);
         const chunkStatuses = {};
+
         for (const idx of chunkIndices) {
             const chunk = await readChunk(jobId, idx).catch(() => null);
-            if (chunk) chunkStatuses[idx] = { status: chunk.status, retry: chunk.retry };
+            if (chunk) {
+                chunkStatuses[idx] = {
+                    status: chunk.status,
+                    retry: chunk.retry,
+                };
+            }
         }
 
         return {
@@ -97,7 +106,7 @@ export default async function srtRoutes(fastify) {
         };
     });
 
-    // ── GET /api/srt/:jobId/download ───────────────────────────────────────────
+    // ── GET /api/srt/:jobId/download ─────────────────────
     fastify.get("/:jobId/download", async (request, reply) => {
         const { jobId } = request.params;
 
@@ -115,8 +124,9 @@ export default async function srtRoutes(fastify) {
         }
 
         const srtContent = await readFinalSRT(jobId).catch(() => null);
+
         if (!srtContent) {
-            return reply.code(500).send({ error: "Final SRT file missing" });
+            return reply.code(500).send({ error: "Final SRT missing" });
         }
 
         return reply

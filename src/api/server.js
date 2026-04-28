@@ -8,6 +8,7 @@ import Fastify from "fastify";
 import cors from "@fastify/cors";
 import srtRoutes from "./routes/srt.js";
 import { startWorker } from "../worker/worker.js";
+import multipart from '@fastify/multipart';
 
 const HOST = process.env.HOST || "0.0.0.0";
 const PORT = parseInt(process.env.PORT || "3000", 10);
@@ -23,7 +24,7 @@ const fastify = Fastify({
 });
 
 // ── Plugins ──────────────────────────────────────────────────────────────────
-
+await fastify.register(multipart);
 await fastify.register(cors, {
     origin: process.env.CORS_ORIGIN || "*",
 });
