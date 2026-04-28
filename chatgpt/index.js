@@ -139,7 +139,7 @@ export class ChatGPTReversed {
         };
     }
 
-    // Standard completion (stateless)
+    // Overloaded complete method (no types, just logic)
     async complete(message, options = {}) {
         const session = await this.getSession();
 
@@ -183,6 +183,7 @@ export class ChatGPTReversed {
                         },
                     },
                 ],
+                paragen_cot_summary_display_override: "allow",
                 parent_message_id: "client-created-root",
                 model: "auto",
                 timezone_offset_min: -60,
@@ -221,122 +222,6 @@ export class ChatGPTReversed {
 
         return this.collectFullResponse(response);
     }
-
-    // Persistent conversation method
-    async completeInConversation(message, { conversationId, parentMessageId }) {
-    const session = await this.getSession();
-
-    if (!ChatGPTReversed.initialized) {
-        throw new Error("ChatGPTReversed has not been initialized.");
-    }
-
-    const headers = await simulateBypassHeaders({
-        accept: "text/event-stream",
-        spoofAddress: true,
-        preOaiUUID: session.uuid,
-    });
-
-    const messageID = randomUUID();
-
-    const body = {
-        action: "next",
-        messages: [
-            {
-                id: messageID,
-                author: { role: "user" },
-                create_time: Date.now(),
-                content: {
-                    content_type: "text",
-                    parts: [message],
-                },
-                metadata: {},
-            },
-        ],
-        parent_message_id: parentMessageId || "client-created-root",
-        model: "auto",
-        conversation_id: conversationId,   // must be a UUID string
-        timezone_offset_min: -60,
-        timezone: "Europe/Berlin",
-        suggestions: [],
-        history_and_training_disabled: true,
-        conversation_mode: { kind: "primary_assistant" },
-        system_hints: [],
-        supports_buffering: true,
-        supported_encodings: ["v1"],
-        client_contextual_info: {
-            is_dark_mode: true,
-            time_since_loaded: 7,
-            page_height: 911,
-            page_width: 1080,
-            pixel_ratio: 1,
-            screen_height: 1080,
-            screen_width: 1920,
-            app_name: "chatgpt.com",
-        },
-    };
-
-    const response = await fetch("https://chatgpt.com/backend-anon/conversation", {
-        headers: {
-            ...headers,
-            Cookie: `__Host-next-auth.csrf-token=${session.csrf}; oai-did=${session.uuid}; oai-nav-state=1; oai-sc=${session.sentinel.oaiSc};`,
-            "openai-sentinel-chat-requirements-token": session.sentinel.token,
-            "openai-sentinel-proof-token": session.sentinel.proof,
-        },
-        body: JSON.stringify(body),
-        method: "POST",
-    });
-
-    if (!response.ok) {
-        // Read the error body for debugging
-        let errorText = "";
-        try {
-            errorText = await response.text();
-        } catch (e) {}
-        throw new Error(`Request failed with status ${response.status}: ${response.statusText} – ${errorText.slice(0, 200)}`);
-    }
-
-    // Parse streaming response (same as before)
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    let fullText = "";
-    let lastMessageId = null;
-
-    while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        let lines = buffer.split("\n");
-        buffer = lines.pop() || "";
-
-        for (const line of lines) {
-            if (!line.startsWith("data:")) continue;
-            const dataStr = line.slice("data:".length).trim();
-            if (!dataStr || dataStr === "[DONE]") continue;
-
-            try {
-                const json = JSON.parse(dataStr);
-                if (json.message) {
-                    if (json.message.id) lastMessageId = json.message.id;
-                    if (json.message.content?.parts) {
-                        fullText = json.message.content.parts[0];
-                    }
-                    if (json.message.status === "finished_successfully") {
-                        return { text: fullText, messageId: lastMessageId };
-                    }
-                }
-                if (json.o === "append" && json.p === "/message/content/parts/0") {
-                    fullText += json.v;
-                }
-            } catch {
-                // ignore parse errors
-            }
-        }
-    }
-
-    return { text: fullText, messageId: lastMessageId };
-}
 
     async collectFullResponse(response) {
         const reader = response.body.getReader();

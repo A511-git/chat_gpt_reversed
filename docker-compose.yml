@@ -1,18 +1,12 @@
-version: "3.9"
-
 services:
-  app:
+  srt-backend:
     build: .
     ports:
       - "3000:3000"
     environment:
-      PORT: 3000
-      HOST: 0.0.0.0
-      NODE_ENV: production
-      LOG_LEVEL: info
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - PORT=3000
     volumes:
-      - srt_data:/app/data
+      # Persist job data and logs across restarts
+      - ./data:/app/src/data
     restart: unless-stopped
-
-volumes:
-  srt_data:
