@@ -3,9 +3,8 @@ import { randomUUID } from "crypto";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import {ChatGPTReversed} from "./chatgpt/index.js"; // Assumes default export
+import { ChatGPTReversed } from "./chatgpt/index.js";
 import multer from "multer";
-
 
 // ---------------------------------------------------------------------------
 // Setup
@@ -28,6 +27,13 @@ fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true });
 
 // Initialize ChatGPT reversed instance (reuses session)
 const chatGPT = new ChatGPTReversed({ maintainSession: true });
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+const CHUNK_SIZE = 15;                     // Reduced from 40 to avoid blocks
+const DELAY_BETWEEN_CHUNKS_MS = 1500;      // Wait 1.5s between chunks
+const MIN_OUTPUT_LINES_RATIO = 0.7;        // Require at least 70% of expected lines
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -87,9 +93,28 @@ function buildSrt(blocks) {
 }
 
 // ---------------------------------------------------------------------------
-// AI processing using ChatGPTReversed
+// AI processing with retry & session refresh
 // ---------------------------------------------------------------------------
-const CHUNK_SIZE = 40; // lines per chunk
+async function callChatGPTWithRetry(prompt, jobId, chunkIndex, maxRetries = 2) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      log("INFO", `[${jobId}] Chunk ${chunkIndex} attempt ${attempt} - sending to ChatGPT`);
+      const response = await chatGPT.complete(prompt);
+      return response;
+    } catch (err) {
+      log("ERROR", `[${jobId}] Chunk ${chunkIndex} failed: ${err.message}`);
+      const is403 = err.message?.includes("403") || err.toString().includes("403");
+      if (is403 && attempt < maxRetries) {
+        log("WARN", `[${jobId}] Received 403, refreshing session and retrying...`);
+        await chatGPT.refreshSession();
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      } else {
+        throw err;
+      }
+    }
+  }
+  throw new Error("Max retries exceeded");
+}
 
 async function processSrt(srtText, instruction, jobId) {
   const blocks = parseSrt(srtText);
@@ -99,6 +124,7 @@ async function processSrt(srtText, instruction, jobId) {
 
   for (let i = 0; i < blocks.length; i += CHUNK_SIZE) {
     const chunk = blocks.slice(i, i + CHUNK_SIZE);
+    const chunkIndex = Math.floor(i / CHUNK_SIZE) + 1;
     const sourceLines = chunk.map(b => b.lines.join(" ")).join("\n");
 
     const prompt = `You are an SRT subtitle processor. Follow the user instruction exactly.
@@ -113,14 +139,13 @@ Output ONLY the processed lines — one per input line, nothing else.
 INPUT LINES (${chunk.length} lines):
 ${sourceLines}`;
 
-    log("INFO", `[${jobId}] Sending chunk ${Math.floor(i / CHUNK_SIZE) + 1} (${chunk.length} lines) to ChatGPT`);
+    log("INFO", `[${jobId}] Sending chunk ${chunkIndex} (${chunk.length} lines) to ChatGPT`);
 
     let rawOutput = "";
     try {
-      rawOutput = await chatGPT.complete(prompt);
+      rawOutput = await callChatGPTWithRetry(prompt, jobId, chunkIndex);
     } catch (err) {
-      log("ERROR", `[${jobId}] ChatGPT request failed`, err.message);
-      // Mark all lines in this chunk as SKIPPED
+      log("ERROR", `[${jobId}] Chunk ${chunkIndex} failed after retries, marking whole chunk as SKIPPED`);
       for (const block of chunk) {
         results.push({
           index: block.index,
@@ -132,8 +157,22 @@ ${sourceLines}`;
     }
 
     const outputLines = rawOutput.trim().split("\n").map(l => l.trim());
-    log("INFO", `[${jobId}] ChatGPT returned ${outputLines.length} lines for chunk`);
+    log("INFO", `[${jobId}] Chunk ${chunkIndex} returned ${outputLines.length} lines (expected ${chunk.length})`);
 
+    // If too few lines, assume refusal or error -> mark whole chunk as SKIPPED
+    if (outputLines.length < chunk.length * MIN_OUTPUT_LINES_RATIO) {
+      log("WARN", `[${jobId}] Chunk ${chunkIndex} returned too few lines, marking entire chunk as SKIPPED`);
+      for (const block of chunk) {
+        results.push({
+          index: block.index,
+          timecode: block.timecode,
+          text: "SKIPPED",
+        });
+      }
+      continue;
+    }
+
+    // Match output lines to blocks
     for (let j = 0; j < chunk.length; j++) {
       const translated = outputLines[j] ?? "SKIPPED";
       if (translated.toUpperCase() === "SKIPPED") {
@@ -146,21 +185,29 @@ ${sourceLines}`;
         text: translated,
       });
     }
+
+    // Delay between chunks to avoid rate limiting
+    if (i + CHUNK_SIZE < blocks.length) {
+      await new Promise(resolve => setTimeout(resolve, DELAY_BETWEEN_CHUNKS_MS));
+    }
   }
 
+  // Rebuild SRT preserving original order
+  results.sort((a, b) => a.index - b.index);
   const finalSrt = buildSrt(results);
   log("INFO", `[${jobId}] Built final SRT with ${results.length} blocks`);
   return finalSrt;
 }
 
 // ---------------------------------------------------------------------------
-// Routes (identical to original)
+// Routes
 // ---------------------------------------------------------------------------
 
-// POST /process/srt
-app.get("/process/srt", upload.none(), async (req, res) => {
+// POST /process/srt – now accepts multipart/form-data and JSON
+app.post("/process/srt", upload.none(), async (req, res) => {
   const { instruction, srtText } = req.body;
-  log("INFO", "POST /process/srt", { instruction, srtText })
+  log("INFO", "POST /process/srt", { instruction: instruction?.substring(0, 50), srtTextLength: srtText?.length });
+
   if (!instruction || !srtText) {
     log("WARN", "Missing instruction or srtText in request");
     return res.status(400).json({ error: "Both 'instruction' and 'srtText' are required." });
@@ -173,7 +220,7 @@ app.get("/process/srt", upload.none(), async (req, res) => {
   saveJob(jobId, jobData);
   log("INFO", `[${jobId}] Job created`);
 
-  // Fire and forget
+  // Fire and forget processing
   (async () => {
     try {
       saveJob(jobId, { ...jobData, status: "processing", updatedAt: new Date().toISOString() });
@@ -265,5 +312,5 @@ app.get("/data/output/:jobId", (req, res) => {
 // ---------------------------------------------------------------------------
 const PORT = process.env.PORT ?? 3000;
 app.listen(PORT, () => {
-  log("INFO", `SRT backend (ChatGPT) listening on port ${PORT}`);
+  log("INFO", `SRT backend (ChatGPTReversed) listening on port ${PORT}`);
 });
